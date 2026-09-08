@@ -50,9 +50,23 @@ class RosbagAR1Cache:
         }
         self.lidar_t = _read_times(self.root / "lidar", ".npz")
 
-    def valid_t0_range_ns(self, num_history_steps=16, time_step_s=0.1, num_frames=4):
-        earliest_offset_ns = max((num_history_steps - 1) * time_step_s, (num_frames - 1) * time_step_s) * 1e9
-        return int(self.pose_t[0] + earliest_offset_ns), int(self.pose_t[-1])
+    def valid_t0_range_ns(
+        self,
+        num_history_steps: int = 16,
+        ego_time_step_s: float = 0.1,
+        num_frames: int = 4,
+        time_interval: float = 0.1,
+    ):
+        """Return the valid t0 range for the requested history/image sampling.
+
+        ego_time_step_s controls ego-pose history sampling.
+        time_interval controls camera-frame sampling only.
+        """
+        earliest_offset_s = max(
+            (num_history_steps - 1) * ego_time_step_s,
+            (num_frames - 1) * time_interval,
+        )
+        return int(self.pose_t[0] + earliest_offset_s * 1e9), int(self.pose_t[-1])
 
     def pose_at(self, timestamps_ns: np.ndarray) -> tuple[np.ndarray, Rotation]:
         timestamps_ns = np.asarray(timestamps_ns, dtype=np.int64)
@@ -88,16 +102,61 @@ def load_rosbag_with_lidar(
     cache: RosbagAR1Cache,
     t0_ns: int,
     num_history_steps: int = 16,
-    time_step: float = 0.1,
+    ego_time_step: float = 0.1,
     num_frames: int = 4,
+    time_interval: float = 0.1,
+    image_order: list[int] | tuple[int, ...] | None = None,
 ) -> dict[str, Any]:
-    """Return exactly the fields consumed by your current inference code.
+    """Return the fields consumed by Alpamayo-R1 inference.
 
-    t0 is the newest image / pose instant. It uses 16 ego poses from t0-1.5s to t0
-    and four images from t0-0.3s to t0. The model does not consume future GT.
+    Args:
+        cache: Pre-extracted ROS bag cache.
+        t0_ns: Newest image / pose timestamp in nanoseconds.
+        num_history_steps: Number of ego-history poses. Default: 16.
+        ego_time_step: Ego-history pose spacing in seconds. Keep at 0.1 s
+            unless you intentionally want to change Alpamayo's ego-history input.
+        num_frames: Number of images per camera. Default: 4.
+        time_interval: Camera image spacing in seconds. Default: 0.1 s.
+        image_order: 1-based temporal image order. With 4 frames,
+            1=oldest and 4=newest. Default: [1, 2, 3, 4].
+            Repeated indices are allowed, e.g. [1, 1, 1, 1].
+
+    With num_frames=4:
+        time_interval=0.1 -> [t-0.3, t-0.2, t-0.1, t]
+        time_interval=0.2 -> [t-0.6, t-0.4, t-0.2, t]
+        time_interval=0.3 -> [t-0.9, t-0.6, t-0.3, t]
+
+    The model does not consume future GT here.
     """
-    dt_ns = int(round(time_step * 1e9))
-    history_t = t0_ns + np.arange(-(num_history_steps - 1), 1, dtype=np.int64) * dt_ns
+    if time_interval <= 0:
+        raise ValueError(f"time_interval must be > 0, got {time_interval}")
+    if ego_time_step <= 0:
+        raise ValueError(f"ego_time_step must be > 0, got {ego_time_step}")
+
+    if image_order is None:
+        image_order = list(range(1, num_frames + 1))
+    else:
+        image_order = list(image_order)
+
+    if len(image_order) != num_frames:
+        raise ValueError(
+            f"image_order must contain exactly {num_frames} values, got {image_order}"
+        )
+    if any(i < 1 or i > num_frames for i in image_order):
+        raise ValueError(
+            f"image_order values must be in [1, {num_frames}], got {image_order}"
+        )
+
+    # Convert user-facing 1-based order to zero-based indices.
+    # Repeated indices are intentionally allowed.
+    image_order_idx = np.asarray(image_order, dtype=np.int64) - 1
+
+    # Ego history remains at Alpamayo's original 10 Hz by default.
+    ego_dt_ns = int(round(ego_time_step * 1e9))
+    history_t = (
+        t0_ns
+        + np.arange(-(num_history_steps - 1), 1, dtype=np.int64) * ego_dt_ns
+    )
     history_xyz_world, history_rot_world = cache.pose_at(history_t)
     t0_xyz = history_xyz_world[-1]
     t0_rot = history_rot_world[-1]
@@ -106,11 +165,31 @@ def load_rosbag_with_lidar(
     history_xyz_ego = t0_rot_inv.apply(history_xyz_world - t0_xyz)
     history_rot_ego = (t0_rot_inv * history_rot_world).as_matrix()
 
-    image_t = t0_ns + np.arange(-(num_frames - 1), 1, dtype=np.int64) * dt_ns
+    # Camera sampling interval is independently configurable.
+    image_dt_ns = int(round(time_interval * 1e9))
+    image_t = (
+        t0_ns
+        + np.arange(-(num_frames - 1), 1, dtype=np.int64) * image_dt_ns
+    )
+
+    base_offsets_s = ((image_t - t0_ns).astype(np.float64) * 1e-9).tolist()
+    ordered_image_t = image_t[image_order_idx]
+    ordered_offsets_s = ((ordered_image_t - t0_ns).astype(np.float64) * 1e-9).tolist()
+
+    print(
+        "[load_rosbag_with_lidar] base image offsets (s):",
+        base_offsets_s,
+    )
+    print(
+        "[load_rosbag_with_lidar] image order:",
+        image_order,
+        "-> ordered offsets (s):",
+        ordered_offsets_s,
+    )
     frames_by_camera, timestamps_by_camera = [], []
     for key in CAMERA_KEYS:
         frames, actual_times = [], []
-        for t in image_t:
+        for t in ordered_image_t:
             frame, actual_t = cache.image_at(key, int(t))
             frames.append(frame)
             actual_times.append(actual_t)
