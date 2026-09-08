@@ -20,10 +20,32 @@ def main():
     p.add_argument("--stride-s", type=float, default=1.0)
     p.add_argument("--num-steps", type=int, default=50)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--time-interval",
+        type=float,
+        default=0.1,
+        help="Camera frame interval in seconds. Default=0.1",
+    )
+    p.add_argument(
+        "--image-order",
+        type=int,
+        nargs=4,
+        default=[1, 2, 3, 4],
+        metavar=("I1", "I2", "I3", "I4"),
+        help=(
+            "Order of the 4 temporal images for each camera. "
+            "1=oldest and 4=newest. Examples: "
+            "--image-order 2 4 3 1, --image-order 1 1 1 1, "
+            "--image-order 4 3 2 1. Default: 1 2 3 4"
+        ),
+    )
     args = p.parse_args()
 
     cache = RosbagAR1Cache(args.cache)
-    valid_start, valid_end = cache.valid_t0_range_ns()
+    # valid_start, valid_end = cache.valid_t0_range_ns()
+    valid_start, valid_end = cache.valid_t0_range_ns(
+        time_interval=args.time_interval   
+    )
     start_ns = max(valid_start, int(cache.pose_t[0] + args.start_offset_s * 1e9))
     stride_ns = int(args.stride_s * 1e9)
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
@@ -40,7 +62,13 @@ def main():
         if t0_ns > valid_end:
             print(f"Stop: t0={t0_ns} exceeds pose range")
             break
-        data = load_rosbag_with_lidar(cache, t0_ns)
+        # data = load_rosbag_with_lidar(cache, t0_ns)
+        data = load_rosbag_with_lidar(
+            cache,
+            t0_ns,
+            time_interval=args.time_interval,
+            image_order=args.image_order,
+        )
         messages = helper.create_message(data["image_frames"].flatten(0, 1))
         inputs = processor.apply_chat_template(messages, tokenize=True, add_generation_prompt=False,
                                                continue_final_message=True, return_dict=True, return_tensors="pt")
